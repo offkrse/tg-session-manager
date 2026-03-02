@@ -19,12 +19,12 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 import logging
 
-VERSION_APP = "1.0"
-
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
 
 load_dotenv()
+
+VERSION_APP = "1.1"
 
 API_ID = os.getenv("API_ID")
 API_HASH = os.getenv("API_HASH")
@@ -164,6 +164,7 @@ async def update_telegram_profile(session_id: str, user_data: dict) -> dict:
         from telethon import TelegramClient
         from telethon.tl.functions.account import UpdateProfileRequest, UpdateUsernameRequest
         from telethon.tl.functions.photos import UploadProfilePhotoRequest
+        from telethon.errors import UsernameOccupiedError, UsernameInvalidError, UsernameNotModifiedError
         
         client = TelegramClient(str(session_path.with_suffix('')), int(API_ID), API_HASH)
         await client.connect()
@@ -173,8 +174,10 @@ async def update_telegram_profile(session_id: str, user_data: dict) -> dict:
             return {"success": False, "error": "Not authorized"}
         
         results = {}
+        errors = []
         
-        # Update profile
+        # Update profile (with small delay)
+        await asyncio.sleep(0.5)
         try:
             await client(UpdateProfileRequest(
                 first_name=user_data.get("firstName", "") or "",
@@ -184,28 +187,46 @@ async def update_telegram_profile(session_id: str, user_data: dict) -> dict:
             results["profile"] = "ok"
         except Exception as e:
             results["profile"] = str(e)
+            errors.append(f"Профиль: {e}")
         
-        # Update username
+        # Update username (with delay)
         if user_data.get("username"):
+            await asyncio.sleep(1)
             try:
                 await client(UpdateUsernameRequest(username=user_data["username"]))
                 results["username"] = "ok"
+            except UsernameOccupiedError:
+                results["username"] = "occupied"
+                errors.append(f"Username @{user_data['username']} уже занят")
+            except UsernameInvalidError:
+                results["username"] = "invalid"
+                errors.append(f"Username @{user_data['username']} недопустим")
+            except UsernameNotModifiedError:
+                results["username"] = "same"
             except Exception as e:
                 results["username"] = str(e)
+                errors.append(f"Username: {e}")
         
-        # Upload photo if exists
+        # Upload photo if exists (with delay)
         photo_path = PHOTOS_DIR / f"{user_data.get('id', '')}.jpg"
         if photo_path.exists():
+            await asyncio.sleep(1)
             try:
                 uploaded = await client.upload_file(str(photo_path))
                 await client(UploadProfilePhotoRequest(file=uploaded))
                 results["photo"] = "ok"
             except Exception as e:
                 results["photo"] = str(e)
+                errors.append(f"Фото: {e}")
         
         await client.disconnect()
         logger.info(f"[{session_id}] Results: {results}")
-        return {"success": True, "results": results}
+        
+        return {
+            "success": len(errors) == 0,
+            "results": results,
+            "errors": errors if errors else None
+        }
         
     except Exception as e:
         logger.error(f"[{session_id}] Error: {e}")
@@ -294,7 +315,7 @@ async def upload_user_photo(user_id: str, photo: UploadFile = File(...)):
 
 @app.post("/users/{user_id}/apply")
 async def apply_user_to_sessions(user_id: str):
-    """Apply user data to all assigned sessions"""
+    """Apply user data to all assigned sessions with delays"""
     users = load_users()
     user = next((u for u in users if u["id"] == user_id), None)
     if not user:
@@ -304,11 +325,27 @@ async def apply_user_to_sessions(user_id: str):
     assigned = [s for s in sessions if s["userId"] == user_id]
     
     results = []
-    for session in assigned:
+    all_errors = []
+    
+    for i, session in enumerate(assigned):
+        # Delay between sessions (except first)
+        if i > 0:
+            await asyncio.sleep(2)
+        
         result = await update_telegram_profile(session["id"], user)
         results.append({"session": session["id"], "result": result})
+        
+        if result.get("errors"):
+            all_errors.extend([f"{session['id']}: {e}" for e in result["errors"]])
     
-    return {"success": True, "data": {"applied": len(assigned), "results": results}}
+    return {
+        "success": len(all_errors) == 0,
+        "data": {
+            "applied": len(assigned),
+            "results": results,
+            "errors": all_errors if all_errors else None
+        }
+    }
 
 
 # === API: Sessions ===
