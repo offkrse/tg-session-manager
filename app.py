@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 load_dotenv()
 
-VERSION_APP = "1.2"
+VERSION_APP = "1.3"
 
 API_ID = os.getenv("API_ID")
 API_HASH = os.getenv("API_HASH")
@@ -159,27 +159,55 @@ def parse_text_file(filepath: Path) -> List[dict]:
     """Parse text file and extract bot names and messages"""
     messages = []
     if not filepath.exists():
+        logger.warning(f"Text file not found: {filepath}")
         return messages
+    
+    logger.info(f"Parsing text file: {filepath}")
+    
     with open(filepath, "r", encoding="utf-8") as f:
-        for i, line in enumerate(f, 1):
-            line = line.strip()
-            if not line:
-                continue
-            match = re.match(r'^([^:]+):<(.+)>$', line)
-            if match:
-                messages.append({
-                    "line": i,
-                    "name": match.group(1).strip(),
-                    "text": match.group(2)
-                })
+        content = f.read()
+    
+    # Split by newlines, but also handle cases where entries might be on same line
+    lines = content.replace('\r\n', '\n').replace('\r', '\n').split('\n')
+    
+    line_num = 0
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        
+        # Match pattern: Name:<message>
+        # Name can contain any characters except ":"
+        match = re.match(r'^([^:]+):<(.+)>$', line)
+        if match:
+            line_num += 1
+            name = match.group(1).strip()
+            text = match.group(2).strip()
+            messages.append({
+                "line": line_num,
+                "name": name,
+                "text": text
+            })
+            logger.debug(f"Parsed line {line_num}: {name} -> {text[:30]}...")
+    
+    logger.info(f"Parsed {len(messages)} messages from text file")
     return messages
 
 
 def get_bots_from_text() -> List[dict]:
     """Get unique bots from text file with message counts"""
     text_file = TEXTS_DIR / "text_bad_1.txt"
+    
+    logger.info(f"Looking for text file at: {text_file}")
+    logger.info(f"File exists: {text_file.exists()}")
+    
     messages = parse_text_file(text_file)
     
+    if not messages:
+        logger.warning("No messages parsed from text file")
+        return []
+    
+    # Count messages per bot and track order of appearance
     bot_messages = defaultdict(int)
     bot_order = {}
     
@@ -198,7 +226,10 @@ def get_bots_from_text() -> List[dict]:
             "userId": None
         })
     
-    return sorted(bots, key=lambda b: b["ordinal"])
+    result = sorted(bots, key=lambda b: b["ordinal"])
+    logger.info(f"Found {len(result)} unique bots: {[b['name'] for b in result]}")
+    
+    return result
 
 
 def get_group_bots(group_id: str) -> List[dict]:
@@ -591,7 +622,7 @@ async def assign_bot(group_id: str, data: BotAssign):
 
 @app.post("/groups/{group_id}/auto-assign-bots")
 async def auto_assign_bots(group_id: str):
-    """Auto-assign bots to users by matching usernames"""
+    """Auto-assign bots to users by matching usernames (fuzzy) or random"""
     groups = load_groups()
     group = next((g for g in groups if g["id"] == group_id), None)
     if not group:
@@ -600,32 +631,94 @@ async def auto_assign_bots(group_id: str):
     users = load_users()
     bots = get_bots_from_text()
     
+    if not users:
+        return {"success": False, "error": "No users available"}
+    
+    if not bots:
+        return {"success": False, "error": "No bots in text file"}
+    
     if "settings" not in group:
         group["settings"] = GroupSettings().dict()
     
-    if "botAssignments" not in group["settings"]:
-        group["settings"]["botAssignments"] = {}
+    # Clear previous assignments
+    group["settings"]["botAssignments"] = {}
     
-    assigned_count = 0
+    # Track which users are assigned
+    assigned_users = set()
+    unassigned_bots = []
     
+    # First pass: fuzzy matching by name
     for bot in bots:
         bot_name_lower = bot["name"].lower()
+        # Remove common suffixes/prefixes for better matching
+        bot_name_clean = re.sub(r'[\[\]()_\-\s]', '', bot_name_lower)
+        
+        best_match = None
+        best_score = 0
         
         for user in users:
+            if user["id"] in assigned_users:
+                continue
+                
             user_username = (user.get("username") or "").lower()
             user_first_name = (user.get("firstName") or "").lower()
             
-            if (user_username and user_username in bot_name_lower) or \
-               (user_first_name and user_first_name in bot_name_lower) or \
-               (user_username and bot_name_lower in user_username) or \
-               (user_first_name and bot_name_lower in user_first_name):
-                group["settings"]["botAssignments"][bot["name"]] = user["id"]
-                assigned_count += 1
-                break
+            # Clean names for comparison
+            username_clean = re.sub(r'[\[\]()_\-\s]', '', user_username)
+            firstname_clean = re.sub(r'[\[\]()_\-\s]', '', user_first_name)
+            
+            score = 0
+            
+            # Exact match
+            if bot_name_clean == username_clean or bot_name_clean == firstname_clean:
+                score = 100
+            # Contains match
+            elif username_clean and (username_clean in bot_name_clean or bot_name_clean in username_clean):
+                score = 80
+            elif firstname_clean and (firstname_clean in bot_name_clean or bot_name_clean in firstname_clean):
+                score = 70
+            # Partial match (at least 3 chars)
+            elif len(bot_name_clean) >= 3:
+                if username_clean and len(username_clean) >= 3:
+                    # Check if first 3+ characters match
+                    min_len = min(len(bot_name_clean), len(username_clean))
+                    if min_len >= 3 and bot_name_clean[:3] == username_clean[:3]:
+                        score = 50
+                if firstname_clean and len(firstname_clean) >= 3:
+                    min_len = min(len(bot_name_clean), len(firstname_clean))
+                    if min_len >= 3 and bot_name_clean[:3] == firstname_clean[:3]:
+                        score = max(score, 40)
+            
+            if score > best_score:
+                best_score = score
+                best_match = user
+        
+        if best_match and best_score >= 40:
+            group["settings"]["botAssignments"][bot["name"]] = best_match["id"]
+            assigned_users.add(best_match["id"])
+            logger.info(f"Matched bot '{bot['name']}' to user '{best_match.get('username') or best_match.get('firstName')}' (score: {best_score})")
+        else:
+            unassigned_bots.append(bot)
+    
+    # Second pass: assign remaining users to unassigned bots randomly
+    remaining_users = [u for u in users if u["id"] not in assigned_users]
+    
+    for bot in unassigned_bots:
+        if remaining_users:
+            user = remaining_users.pop(0)
+            group["settings"]["botAssignments"][bot["name"]] = user["id"]
+            logger.info(f"Randomly assigned bot '{bot['name']}' to user '{user.get('username') or user.get('firstName')}'")
+    
+    # Bots without users will be skipped during chat imitation
+    unassigned_count = len([b for b in bots if b["name"] not in group["settings"]["botAssignments"]])
+    if unassigned_count > 0:
+        logger.warning(f"{unassigned_count} bots have no users assigned and will be skipped")
     
     save_groups(groups)
     
-    return {"success": True, "data": {"assigned": assigned_count}}
+    assigned_count = len(group["settings"]["botAssignments"])
+    
+    return {"success": True, "data": {"assigned": assigned_count, "skipped": unassigned_count}}
 
 
 @app.delete("/groups/{group_id}")
@@ -759,6 +852,34 @@ async def health():
     }
 
 
+@app.get("/debug/text-file")
+async def debug_text_file():
+    """Debug endpoint to check text file parsing"""
+    text_file = TEXTS_DIR / "text_bad_1.txt"
+    
+    result = {
+        "texts_dir": str(TEXTS_DIR),
+        "text_file_path": str(text_file),
+        "exists": text_file.exists(),
+        "bots": [],
+        "messages_count": 0,
+        "raw_content_preview": ""
+    }
+    
+    if text_file.exists():
+        with open(text_file, "r", encoding="utf-8") as f:
+            content = f.read()
+        result["raw_content_preview"] = content[:500]
+        
+        messages = parse_text_file(text_file)
+        result["messages_count"] = len(messages)
+        
+        bots = get_bots_from_text()
+        result["bots"] = bots
+    
+    return result
+
+
 # === Chat Imitation ===
 async def run_chat_imitation(group_id: str, settings: GroupSettings):
     logger.info(f"[{group_id}] Starting chat imitation")
@@ -870,9 +991,38 @@ async def run_chat_imitation(group_id: str, settings: GroupSettings):
                         invite_info = await client(CheckChatInviteRequest(invite_hash))
                         
                         if isinstance(invite_info, ChatInviteAlready):
-                            logger.info(f"[{group_id}] Session {session_id} already in group")
-                            entity = invite_info.chat
-                            joined_sessions.add(session_id)
+                            # Already joined via this invite, but verify it's the right group
+                            invite_chat = invite_info.chat
+                            invite_chat_id = getattr(invite_chat, 'id', None)
+                            
+                            # For supergroups/channels, the ID might be different format
+                            # Compare absolute values or check if matches
+                            actual_chat_id = abs(chat_id) if chat_id < 0 else chat_id
+                            invite_chat_id_abs = abs(invite_chat_id) if invite_chat_id else None
+                            
+                            # Remove -100 prefix for comparison
+                            if actual_chat_id > 1000000000000:
+                                actual_chat_id = actual_chat_id - 1000000000000
+                            
+                            logger.info(f"[{group_id}] Invite chat ID: {invite_chat_id}, target: {chat_id}, actual: {actual_chat_id}")
+                            
+                            if invite_chat_id == actual_chat_id or invite_chat_id_abs == actual_chat_id:
+                                logger.info(f"[{group_id}] Session {session_id} already in correct group")
+                                entity = invite_chat
+                                joined_sessions.add(session_id)
+                            else:
+                                logger.warning(f"[{group_id}] Session {session_id} is in different group ({invite_chat_id}), need to join target")
+                                # Try to get entity directly
+                                try:
+                                    entity = await client.get_entity(chat_id)
+                                    joined_sessions.add(session_id)
+                                    logger.info(f"[{group_id}] Session {session_id} found target group directly")
+                                except Exception as e:
+                                    logger.error(f"[{group_id}] Session {session_id} cannot access target group: {e}")
+                                    await client.disconnect()
+                                    msg_idx += 1
+                                    await asyncio.sleep(60)
+                                    continue
                         else:
                             logger.info(f"[{group_id}] Session {session_id} joining via invite...")
                             result = await client(ImportChatInviteRequest(invite_hash))
@@ -884,7 +1034,10 @@ async def run_chat_imitation(group_id: str, settings: GroupSettings):
                     except UserAlreadyParticipantError:
                         logger.info(f"[{group_id}] Session {session_id} already participant")
                         joined_sessions.add(session_id)
-                        entity = await client.get_entity(chat_id)
+                        try:
+                            entity = await client.get_entity(chat_id)
+                        except Exception as e:
+                            logger.error(f"[{group_id}] Session {session_id} get_entity after participant error: {e}")
                     except Exception as e:
                         logger.error(f"[{group_id}] Session {session_id} join error: {e}")
                         await client.disconnect()
