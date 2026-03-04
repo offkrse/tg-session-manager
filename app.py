@@ -1,6 +1,6 @@
 """
 TG Session Manager - Backend Server
-Users + Sessions Architecture
+Users + Sessions + Bots Architecture
 """
 
 import os
@@ -13,6 +13,7 @@ import httpx
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, Dict, List
+from collections import defaultdict
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from pydantic import BaseModel
@@ -24,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 load_dotenv()
 
-VERSION_APP = "1.1"
+VERSION_APP = "1.2"
 
 API_ID = os.getenv("API_ID")
 API_HASH = os.getenv("API_HASH")
@@ -43,7 +44,9 @@ SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 PHOTOS_DIR.mkdir(parents=True, exist_ok=True)
 
+# Active chats and their status
 active_chats: Dict[str, asyncio.Task] = {}
+chat_status: Dict[str, dict] = {}  # group_id -> {currentLine, currentMessage, currentBotName}
 
 app = FastAPI(title="TG Session Manager API")
 
@@ -67,6 +70,11 @@ class SessionAssign(BaseModel):
     userId: Optional[str] = None
 
 
+class BotAssign(BaseModel):
+    botName: str
+    userId: Optional[str] = None
+
+
 class GroupSettings(BaseModel):
     lineRangeStart: int = 1
     lineRangeEnd: int = 100
@@ -80,6 +88,7 @@ class GroupSettings(BaseModel):
     nightStartHour: int = 23
     nightEndHour: int = 7
     inviteLink: str = ""
+    botAssignments: Dict[str, str] = {}  # botName -> userId
 
 
 # === Data helpers ===
@@ -127,7 +136,6 @@ def sync_sessions():
     meta = load_sessions_meta()
     meta_ids = {m["id"] for m in meta}
     
-    # Add new session files
     for session_file in SESSIONS_DIR.glob("*.session"):
         session_id = session_file.stem
         if session_id not in meta_ids:
@@ -140,12 +148,72 @@ def sync_sessions():
                 "uploadedAt": datetime.now().isoformat()
             })
     
-    # Remove deleted session files
     existing_files = {f.stem for f in SESSIONS_DIR.glob("*.session")}
     meta = [m for m in meta if m["id"] in existing_files]
     
     save_sessions_meta(meta)
     return meta
+
+
+def parse_text_file(filepath: Path) -> List[dict]:
+    """Parse text file and extract bot names and messages"""
+    messages = []
+    if not filepath.exists():
+        return messages
+    with open(filepath, "r", encoding="utf-8") as f:
+        for i, line in enumerate(f, 1):
+            line = line.strip()
+            if not line:
+                continue
+            match = re.match(r'^([^:]+):<(.+)>$', line)
+            if match:
+                messages.append({
+                    "line": i,
+                    "name": match.group(1).strip(),
+                    "text": match.group(2)
+                })
+    return messages
+
+
+def get_bots_from_text() -> List[dict]:
+    """Get unique bots from text file with message counts"""
+    text_file = TEXTS_DIR / "text_bad_1.txt"
+    messages = parse_text_file(text_file)
+    
+    bot_messages = defaultdict(int)
+    bot_order = {}
+    
+    for msg in messages:
+        name = msg["name"]
+        bot_messages[name] += 1
+        if name not in bot_order:
+            bot_order[name] = len(bot_order)
+    
+    bots = []
+    for name, count in bot_messages.items():
+        bots.append({
+            "name": name,
+            "ordinal": bot_order[name],
+            "messagesCount": count,
+            "userId": None
+        })
+    
+    return sorted(bots, key=lambda b: b["ordinal"])
+
+
+def get_group_bots(group_id: str) -> List[dict]:
+    """Get bots for a specific group with assignments"""
+    groups = load_groups()
+    group = next((g for g in groups if g["id"] == group_id), None)
+    
+    bots = get_bots_from_text()
+    
+    if group and "settings" in group:
+        assignments = group["settings"].get("botAssignments", {})
+        for bot in bots:
+            bot["userId"] = assignments.get(bot["name"])
+    
+    return bots
 
 
 # === Telegram helpers ===
@@ -176,7 +244,6 @@ async def update_telegram_profile(session_id: str, user_data: dict) -> dict:
         results = {}
         errors = []
         
-        # Update profile (with small delay)
         await asyncio.sleep(0.5)
         try:
             await client(UpdateProfileRequest(
@@ -189,7 +256,6 @@ async def update_telegram_profile(session_id: str, user_data: dict) -> dict:
             results["profile"] = str(e)
             errors.append(f"Профиль: {e}")
         
-        # Update username (with delay)
         if user_data.get("username"):
             await asyncio.sleep(1)
             try:
@@ -207,7 +273,6 @@ async def update_telegram_profile(session_id: str, user_data: dict) -> dict:
                 results["username"] = str(e)
                 errors.append(f"Username: {e}")
         
-        # Upload photo if exists (with delay)
         photo_path = PHOTOS_DIR / f"{user_data.get('id', '')}.jpg"
         if photo_path.exists():
             await asyncio.sleep(1)
@@ -279,14 +344,12 @@ async def delete_user(user_id: str):
     users = [u for u in users if u["id"] != user_id]
     save_users(users)
     
-    # Unassign sessions
     sessions = load_sessions_meta()
     for s in sessions:
         if s["userId"] == user_id:
             s["userId"] = None
     save_sessions_meta(sessions)
     
-    # Delete photo
     for photo in PHOTOS_DIR.glob(f"{user_id}.*"):
         photo.unlink()
     
@@ -300,7 +363,6 @@ async def upload_user_photo(user_id: str, photo: UploadFile = File(...)):
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
     
-    # Save photo
     photo_path = PHOTOS_DIR / f"{user_id}.jpg"
     content = await photo.read()
     with open(photo_path, "wb") as f:
@@ -328,7 +390,6 @@ async def apply_user_to_sessions(user_id: str):
     all_errors = []
     
     for i, session in enumerate(assigned):
-        # Delay between sessions (except first)
         if i > 0:
             await asyncio.sleep(2)
         
@@ -363,7 +424,6 @@ async def upload_session(session: UploadFile = File(...)):
     session_id = Path(session.filename).stem
     session_path = SESSIONS_DIR / f"{session_id}.session"
     
-    # Check if exists
     if session_path.exists():
         return {"success": False, "error": f"Сессия '{session_id}' уже существует"}
     
@@ -415,7 +475,7 @@ async def assign_session(session_id: str, data: SessionAssign):
 
 @app.post("/sessions/auto-assign")
 async def auto_assign_sessions():
-    """Auto-assign unassigned sessions to users"""
+    """Auto-assign unassigned sessions to users, prioritizing users without sessions"""
     users = load_users()
     sessions = load_sessions_meta()
     
@@ -424,13 +484,35 @@ async def auto_assign_sessions():
     
     unassigned = [s for s in sessions if not s["userId"]]
     
-    for i, session in enumerate(unassigned):
-        user = users[i % len(users)]
-        session["userId"] = user["id"]
+    if not unassigned:
+        return {"success": True, "data": {"assigned": 0}}
+    
+    session_count = {u["id"]: 0 for u in users}
+    for s in sessions:
+        if s["userId"] and s["userId"] in session_count:
+            session_count[s["userId"]] += 1
+    
+    users_without_sessions = [u for u in users if session_count[u["id"]] == 0]
+    
+    assigned_count = 0
+    
+    for i, user in enumerate(users_without_sessions):
+        if i < len(unassigned):
+            unassigned[i]["userId"] = user["id"]
+            session_count[user["id"]] += 1
+            assigned_count += 1
+    
+    remaining = unassigned[assigned_count:]
+    if remaining:
+        for session in remaining:
+            min_user = min(users, key=lambda u: session_count[u["id"]])
+            session["userId"] = min_user["id"]
+            session_count[min_user["id"]] += 1
+            assigned_count += 1
     
     save_sessions_meta(sessions)
     
-    return {"success": True, "data": {"assigned": len(unassigned)}}
+    return {"success": True, "data": {"assigned": assigned_count}}
 
 
 # === API: Groups ===
@@ -439,13 +521,120 @@ async def get_groups():
     groups = load_groups()
     for g in groups:
         g["isRunning"] = g["id"] in active_chats
+        g["status"] = chat_status.get(g["id"])
+        g["bots"] = get_group_bots(g["id"])
     return {"success": True, "data": groups}
+
+
+@app.get("/groups/{group_id}")
+async def get_group(group_id: str):
+    groups = load_groups()
+    group = next((g for g in groups if g["id"] == group_id), None)
+    if not group:
+        raise HTTPException(status_code=404, detail="Group not found")
+    
+    group["isRunning"] = group_id in active_chats
+    group["status"] = chat_status.get(group_id)
+    group["bots"] = get_group_bots(group_id)
+    
+    return {"success": True, "data": group}
+
+
+@app.post("/groups/{group_id}/refresh")
+async def refresh_group(group_id: str):
+    """Refresh group info and bots"""
+    groups = load_groups()
+    group = next((g for g in groups if g["id"] == group_id), None)
+    if not group:
+        raise HTTPException(status_code=404, detail="Group not found")
+    
+    group["isRunning"] = group_id in active_chats
+    group["status"] = chat_status.get(group_id)
+    group["bots"] = get_group_bots(group_id)
+    
+    return {"success": True, "data": group}
+
+
+@app.get("/groups/{group_id}/bots")
+async def get_group_bots_api(group_id: str):
+    bots = get_group_bots(group_id)
+    return {"success": True, "data": bots}
+
+
+@app.post("/groups/{group_id}/assign-bot")
+async def assign_bot(group_id: str, data: BotAssign):
+    """Assign a user to a bot"""
+    groups = load_groups()
+    group = next((g for g in groups if g["id"] == group_id), None)
+    if not group:
+        raise HTTPException(status_code=404, detail="Group not found")
+    
+    if "settings" not in group:
+        group["settings"] = GroupSettings().dict()
+    
+    if "botAssignments" not in group["settings"]:
+        group["settings"]["botAssignments"] = {}
+    
+    if data.userId:
+        group["settings"]["botAssignments"][data.botName] = data.userId
+    else:
+        group["settings"]["botAssignments"].pop(data.botName, None)
+    
+    save_groups(groups)
+    
+    group["isRunning"] = group_id in active_chats
+    group["status"] = chat_status.get(group_id)
+    group["bots"] = get_group_bots(group_id)
+    
+    return {"success": True, "data": group}
+
+
+@app.post("/groups/{group_id}/auto-assign-bots")
+async def auto_assign_bots(group_id: str):
+    """Auto-assign bots to users by matching usernames"""
+    groups = load_groups()
+    group = next((g for g in groups if g["id"] == group_id), None)
+    if not group:
+        raise HTTPException(status_code=404, detail="Group not found")
+    
+    users = load_users()
+    bots = get_bots_from_text()
+    
+    if "settings" not in group:
+        group["settings"] = GroupSettings().dict()
+    
+    if "botAssignments" not in group["settings"]:
+        group["settings"]["botAssignments"] = {}
+    
+    assigned_count = 0
+    
+    for bot in bots:
+        bot_name_lower = bot["name"].lower()
+        
+        for user in users:
+            user_username = (user.get("username") or "").lower()
+            user_first_name = (user.get("firstName") or "").lower()
+            
+            if (user_username and user_username in bot_name_lower) or \
+               (user_first_name and user_first_name in bot_name_lower) or \
+               (user_username and bot_name_lower in user_username) or \
+               (user_first_name and bot_name_lower in user_first_name):
+                group["settings"]["botAssignments"][bot["name"]] = user["id"]
+                assigned_count += 1
+                break
+    
+    save_groups(groups)
+    
+    return {"success": True, "data": {"assigned": assigned_count}}
 
 
 @app.delete("/groups/{group_id}")
 async def delete_group(group_id: str):
     if group_id in active_chats:
         active_chats.pop(group_id).cancel()
+    
+    if group_id in chat_status:
+        del chat_status[group_id]
     
     groups = load_groups()
     groups = [g for g in groups if g["id"] != group_id]
@@ -465,6 +654,9 @@ async def update_group_settings(group_id: str, settings: GroupSettings):
     save_groups(groups)
     
     group["isRunning"] = group_id in active_chats
+    group["status"] = chat_status.get(group_id)
+    group["bots"] = get_group_bots(group_id)
+    
     return {"success": True, "data": group}
 
 
@@ -491,6 +683,10 @@ async def stop_chat(group_id: str):
         return {"success": False, "error": "Not running"}
     
     active_chats.pop(group_id).cancel()
+    
+    if group_id in chat_status:
+        del chat_status[group_id]
+    
     return {"success": True}
 
 
@@ -564,21 +760,6 @@ async def health():
 
 
 # === Chat Imitation ===
-def parse_text_file(filepath: Path) -> List[dict]:
-    messages = []
-    if not filepath.exists():
-        return messages
-    with open(filepath, "r", encoding="utf-8") as f:
-        for i, line in enumerate(f, 1):
-            line = line.strip()
-            if not line:
-                continue
-            match = re.match(r'^([^:]+):<(.+)>$', line)
-            if match:
-                messages.append({"line": i, "name": match.group(1).strip(), "text": match.group(2)})
-    return messages
-
-
 async def run_chat_imitation(group_id: str, settings: GroupSettings):
     logger.info(f"[{group_id}] Starting chat imitation")
     
@@ -594,18 +775,28 @@ async def run_chat_imitation(group_id: str, settings: GroupSettings):
         logger.error(f"[{group_id}] No messages in range")
         return
     
-    # Get sessions with users
     sessions = load_sessions_meta()
-    users = load_users()
     
-    assigned_sessions = [s for s in sessions if s["userId"]]
-    if not assigned_sessions:
-        logger.error(f"[{group_id}] No assigned sessions")
+    bot_assignments = settings.botAssignments or {}
+    
+    user_sessions: Dict[str, List[dict]] = defaultdict(list)
+    for s in sessions:
+        if s["userId"]:
+            user_sessions[s["userId"]].append(s)
+    
+    valid_bots = {}
+    for bot_name, user_id in bot_assignments.items():
+        if user_id and user_id in user_sessions and user_sessions[user_id]:
+            valid_bots[bot_name] = {
+                "userId": user_id,
+                "sessions": user_sessions[user_id],
+                "sessionIdx": 0
+            }
+    
+    if not valid_bots:
+        logger.error(f"[{group_id}] No valid bot assignments with sessions")
         return
     
-    # Map names to sessions
-    name_to_session: Dict[str, dict] = {}
-    session_idx = 0
     joined_sessions: set = set()
     
     try:
@@ -614,17 +805,21 @@ async def run_chat_imitation(group_id: str, settings: GroupSettings):
         logger.error(f"[{group_id}] Invalid group ID")
         return
     
-    # Get invite hash
     invite_hash = None
     if settings.inviteLink:
         match = re.search(r'(?:t\.me/\+|t\.me/joinchat/)([a-zA-Z0-9_-]+)', settings.inviteLink)
         if match:
             invite_hash = match.group(1)
+            logger.info(f"[{group_id}] Using invite hash: {invite_hash}")
+    
+    if not invite_hash:
+        logger.warning(f"[{group_id}] No invite link set")
     
     try:
         from telethon import TelegramClient
         from telethon.tl.functions.messages import ImportChatInviteRequest, CheckChatInviteRequest
         from telethon.tl.types import ChatInviteAlready
+        from telethon.errors import UserAlreadyParticipantError, ChatWriteForbiddenError, ChannelPrivateError
         
         msg_idx = 0
         while True:
@@ -632,13 +827,27 @@ async def run_chat_imitation(group_id: str, settings: GroupSettings):
                 msg_idx = 0
             
             msg = filtered[msg_idx]
-            name, text = msg["name"], msg["text"]
+            bot_name, text = msg["name"], msg["text"]
+            line_num = msg["line"]
             
-            if name not in name_to_session:
-                name_to_session[name] = assigned_sessions[session_idx % len(assigned_sessions)]
-                session_idx += 1
+            chat_status[group_id] = {
+                "isRunning": True,
+                "currentLine": line_num,
+                "currentMessage": text[:100],
+                "currentBotName": bot_name
+            }
             
-            session = name_to_session[name]
+            if bot_name not in valid_bots:
+                logger.warning(f"[{group_id}] Bot '{bot_name}' not assigned, skipping")
+                msg_idx += 1
+                continue
+            
+            bot_info = valid_bots[bot_name]
+            bot_sessions = bot_info["sessions"]
+            
+            session = bot_sessions[bot_info["sessionIdx"] % len(bot_sessions)]
+            bot_info["sessionIdx"] += 1
+            
             session_id = session["id"]
             session_path = SESSIONS_DIR / f"{session_id}.session"
             
@@ -647,40 +856,67 @@ async def run_chat_imitation(group_id: str, settings: GroupSettings):
                 await client.connect()
                 
                 if not await client.is_user_authorized():
+                    logger.warning(f"[{group_id}] Session {session_id} not authorized")
                     await client.disconnect()
                     msg_idx += 1
                     continue
                 
                 entity = None
+                need_to_join = session_id not in joined_sessions
                 
-                if session_id not in joined_sessions:
+                if need_to_join and invite_hash:
+                    try:
+                        logger.info(f"[{group_id}] Session {session_id} checking invite...")
+                        invite_info = await client(CheckChatInviteRequest(invite_hash))
+                        
+                        if isinstance(invite_info, ChatInviteAlready):
+                            logger.info(f"[{group_id}] Session {session_id} already in group")
+                            entity = invite_info.chat
+                            joined_sessions.add(session_id)
+                        else:
+                            logger.info(f"[{group_id}] Session {session_id} joining via invite...")
+                            result = await client(ImportChatInviteRequest(invite_hash))
+                            entity = result.chats[0] if result.chats else None
+                            joined_sessions.add(session_id)
+                            logger.info(f"[{group_id}] Session {session_id} joined! Waiting 30s...")
+                            await asyncio.sleep(30)
+                            
+                    except UserAlreadyParticipantError:
+                        logger.info(f"[{group_id}] Session {session_id} already participant")
+                        joined_sessions.add(session_id)
+                        entity = await client.get_entity(chat_id)
+                    except Exception as e:
+                        logger.error(f"[{group_id}] Session {session_id} join error: {e}")
+                        await client.disconnect()
+                        msg_idx += 1
+                        await asyncio.sleep(60)
+                        continue
+                
+                if session_id in joined_sessions and entity is None:
                     try:
                         entity = await client.get_entity(chat_id)
-                        joined_sessions.add(session_id)
-                    except:
-                        if invite_hash:
-                            try:
-                                info = await client(CheckChatInviteRequest(invite_hash))
-                                if isinstance(info, ChatInviteAlready):
-                                    entity = info.chat
-                                else:
-                                    result = await client(ImportChatInviteRequest(invite_hash))
-                                    entity = result.chats[0] if result.chats else None
-                                    logger.info(f"[{group_id}] Session {session_id} joined, waiting 30s...")
-                                    await asyncio.sleep(30)
-                                joined_sessions.add(session_id)
-                            except Exception as e:
-                                logger.error(f"[{group_id}] Join error: {e}")
-                else:
-                    entity = await client.get_entity(chat_id)
+                    except Exception as e:
+                        logger.error(f"[{group_id}] Session {session_id} get_entity error: {e}")
                 
                 if entity:
-                    await client.send_message(entity, text)
-                    logger.info(f"[{group_id}] {name}: {text[:40]}...")
+                    try:
+                        await client.send_message(entity, text)
+                        logger.info(f"[{group_id}] #{line_num} {bot_name} ({session_id}): {text[:40]}...")
+                    except ChatWriteForbiddenError:
+                        logger.error(f"[{group_id}] Session {session_id} cannot write")
+                        joined_sessions.discard(session_id)
+                    except ChannelPrivateError:
+                        logger.error(f"[{group_id}] Session {session_id} - channel is private")
+                        joined_sessions.discard(session_id)
+                    except Exception as e:
+                        logger.error(f"[{group_id}] Session {session_id} send error: {e}")
+                else:
+                    logger.warning(f"[{group_id}] Session {session_id} no entity")
                 
                 await client.disconnect()
+                
             except Exception as e:
-                logger.error(f"[{group_id}] Send error: {e}")
+                logger.error(f"[{group_id}] Session {session_id} error: {e}")
             
             msg_idx += 1
             
@@ -699,5 +935,9 @@ async def run_chat_imitation(group_id: str, settings: GroupSettings):
             
     except asyncio.CancelledError:
         logger.info(f"[{group_id}] Stopped")
+        if group_id in chat_status:
+            del chat_status[group_id]
     except Exception as e:
         logger.error(f"[{group_id}] Error: {e}", exc_info=True)
+        if group_id in chat_status:
+            del chat_status[group_id]
