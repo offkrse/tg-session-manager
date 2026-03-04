@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 load_dotenv()
 
-VERSION_APP = "1.3"
+VERSION_APP = "1.4"
 
 API_ID = os.getenv("API_ID")
 API_HASH = os.getenv("API_HASH")
@@ -991,38 +991,56 @@ async def run_chat_imitation(group_id: str, settings: GroupSettings):
                         invite_info = await client(CheckChatInviteRequest(invite_hash))
                         
                         if isinstance(invite_info, ChatInviteAlready):
-                            # Already joined via this invite, but verify it's the right group
-                            invite_chat = invite_info.chat
-                            invite_chat_id = getattr(invite_chat, 'id', None)
+                            # ChatInviteAlready means the invite was used before,
+                            # but session might have left the group since then!
+                            # We need to verify actual membership
+                            logger.info(f"[{group_id}] Session {session_id} used this invite before, verifying membership...")
                             
-                            # For supergroups/channels, the ID might be different format
-                            # Compare absolute values or check if matches
-                            actual_chat_id = abs(chat_id) if chat_id < 0 else chat_id
-                            invite_chat_id_abs = abs(invite_chat_id) if invite_chat_id else None
-                            
-                            # Remove -100 prefix for comparison
-                            if actual_chat_id > 1000000000000:
-                                actual_chat_id = actual_chat_id - 1000000000000
-                            
-                            logger.info(f"[{group_id}] Invite chat ID: {invite_chat_id}, target: {chat_id}, actual: {actual_chat_id}")
-                            
-                            if invite_chat_id == actual_chat_id or invite_chat_id_abs == actual_chat_id:
-                                logger.info(f"[{group_id}] Session {session_id} already in correct group")
-                                entity = invite_chat
-                                joined_sessions.add(session_id)
-                            else:
-                                logger.warning(f"[{group_id}] Session {session_id} is in different group ({invite_chat_id}), need to join target")
-                                # Try to get entity directly
+                            try:
+                                # Try to get the entity and check if we can actually access it
+                                entity = await client.get_entity(chat_id)
+                                
+                                # Try to get participant info to confirm membership
+                                from telethon.tl.functions.channels import GetParticipantRequest
+                                me = await client.get_me()
                                 try:
-                                    entity = await client.get_entity(chat_id)
+                                    await client(GetParticipantRequest(entity, me))
+                                    logger.info(f"[{group_id}] Session {session_id} confirmed as member")
                                     joined_sessions.add(session_id)
-                                    logger.info(f"[{group_id}] Session {session_id} found target group directly")
-                                except Exception as e:
-                                    logger.error(f"[{group_id}] Session {session_id} cannot access target group: {e}")
-                                    await client.disconnect()
-                                    msg_idx += 1
-                                    await asyncio.sleep(60)
-                                    continue
+                                except Exception as participant_err:
+                                    # Not a participant, need to rejoin
+                                    logger.warning(f"[{group_id}] Session {session_id} not a participant: {participant_err}")
+                                    logger.info(f"[{group_id}] Session {session_id} rejoining via invite...")
+                                    try:
+                                        result = await client(ImportChatInviteRequest(invite_hash))
+                                        entity = result.chats[0] if result.chats else None
+                                        joined_sessions.add(session_id)
+                                        logger.info(f"[{group_id}] Session {session_id} rejoined! Waiting 30s...")
+                                        await asyncio.sleep(30)
+                                    except UserAlreadyParticipantError:
+                                        # Strange, but let's try anyway
+                                        logger.info(f"[{group_id}] Session {session_id} UserAlreadyParticipant on rejoin")
+                                        joined_sessions.add(session_id)
+                                    except Exception as rejoin_err:
+                                        logger.error(f"[{group_id}] Session {session_id} rejoin failed: {rejoin_err}")
+                                        entity = None
+                                        
+                            except Exception as e:
+                                logger.warning(f"[{group_id}] Session {session_id} cannot access group: {e}")
+                                # Try to rejoin
+                                logger.info(f"[{group_id}] Session {session_id} attempting to rejoin...")
+                                try:
+                                    result = await client(ImportChatInviteRequest(invite_hash))
+                                    entity = result.chats[0] if result.chats else None
+                                    joined_sessions.add(session_id)
+                                    logger.info(f"[{group_id}] Session {session_id} rejoined! Waiting 30s...")
+                                    await asyncio.sleep(30)
+                                except UserAlreadyParticipantError:
+                                    logger.error(f"[{group_id}] Session {session_id} claims participant but cannot write - may be restricted")
+                                    entity = None
+                                except Exception as rejoin_err:
+                                    logger.error(f"[{group_id}] Session {session_id} rejoin failed: {rejoin_err}")
+                                    entity = None
                         else:
                             logger.info(f"[{group_id}] Session {session_id} joining via invite...")
                             result = await client(ImportChatInviteRequest(invite_hash))
