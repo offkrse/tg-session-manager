@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 load_dotenv()
 
-VERSION_APP = "1.6"
+VERSION_APP = "1.7"
 
 API_ID = os.getenv("API_ID")
 API_HASH = os.getenv("API_HASH")
@@ -85,7 +85,7 @@ class BotAssign(BaseModel):
 class VerifierSettings(BaseModel):
     enabled: bool = False
     botToken: str = ""
-    botLink: str = ""
+    botUsername: str = ""
     messageText: str = "Для отправки сообщений пройдите верификацию"
     buttonText: str = "Верификация"
 
@@ -108,7 +108,7 @@ class GroupSettings(BaseModel):
     verifier: dict = {
         "enabled": False,
         "botToken": "",
-        "botLink": "",
+        "botUsername": "",
         "messageText": "Для отправки сообщений пройдите верификацию",
         "buttonText": "Верификация"
     }
@@ -391,8 +391,14 @@ async def delete_message(bot_token: str, chat_id: int, message_id: int):
         pass
 
 
-async def send_verify_message(bot_token: str, chat_id: int, text: str, button_text: str, bot_link: str) -> Optional[int]:
+async def send_verify_message(bot_token: str, chat_id: int, text: str, button_text: str, bot_username: str) -> Optional[int]:
     """Send verification message with button, returns message_id"""
+    if not bot_username:
+        return None
+    
+    # Build bot link from username
+    bot_link = f"https://t.me/{bot_username.replace('@', '')}"
+    
     try:
         async with httpx.AsyncClient() as client:
             response = await client.post(
@@ -556,7 +562,7 @@ async def bot_webhook(request: Request):
                                 int(chat_id),
                                 verifier.get("messageText", "Пройдите верификацию"),
                                 verifier.get("buttonText", "Верификация"),
-                                verifier.get("botLink", "")
+                                verifier.get("botUsername", "")
                             )
                             
                             if new_msg_id:
