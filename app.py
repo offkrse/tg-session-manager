@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 load_dotenv()
 
-VERSION_APP = "1.9"
+VERSION_APP = "2.0"
 
 API_ID = os.getenv("API_ID")
 API_HASH = os.getenv("API_HASH")
@@ -383,12 +383,17 @@ async def delete_message(bot_token: str, chat_id: int, message_id: int):
     """Delete message using bot API"""
     try:
         async with httpx.AsyncClient() as client:
-            await client.post(
+            response = await client.post(
                 f"https://api.telegram.org/bot{bot_token}/deleteMessage",
                 json={"chat_id": chat_id, "message_id": message_id}
             )
-    except:
-        pass
+            result = response.json()
+            if result.get("ok"):
+                logger.info(f"[{chat_id}] Deleted message {message_id}")
+            else:
+                logger.warning(f"[{chat_id}] Failed to delete message {message_id}: {result}")
+    except Exception as e:
+        logger.error(f"[{chat_id}] Error deleting message {message_id}: {e}")
 
 
 async def send_verify_message(bot_token: str, chat_id: int, text: str, button_text: str, bot_username: str) -> Optional[int]:
@@ -429,6 +434,7 @@ async def verifier_bot_webhook(group_id: str, request: Request):
     """Webhook for the verifier bot (the one user clicks /start on)"""
     try:
         data = await request.json()
+        logger.info(f"[verifier-{group_id}] Received webhook: {json.dumps(data)[:500]}")
         
         # Handle /start command in private chat
         if "message" in data:
@@ -437,11 +443,15 @@ async def verifier_bot_webhook(group_id: str, request: Request):
             user = message.get("from", {})
             text = message.get("text", "")
             
+            logger.info(f"[verifier-{group_id}] Message from user {user.get('id')} in chat type {chat.get('type')}: {text}")
+            
             # Only handle private messages with /start
             if chat.get("type") == "private" and text.startswith("/start"):
                 user_id = user.get("id")
                 
                 if user_id:
+                    logger.info(f"[verifier-{group_id}] Verifying user {user_id}")
+                    
                     # Verify the user
                     verify_user(group_id, user_id)
                     
@@ -451,8 +461,11 @@ async def verifier_bot_webhook(group_id: str, request: Request):
                     
                     if group:
                         verifier = group.get("settings", {}).get("verifier", {})
+                        logger.info(f"[verifier-{group_id}] verifier.enabled={verifier.get('enabled')}, BOT_TOKEN={'set' if BOT_TOKEN else 'not set'}")
+                        
                         if verifier.get("enabled") and BOT_TOKEN:
                             # Unmute using main bot
+                            logger.info(f"[verifier-{group_id}] Unmuting user {user_id}")
                             await unmute_user(BOT_TOKEN, int(group_id), user_id)
                             
                             # Send confirmation
@@ -466,10 +479,13 @@ async def verifier_bot_webhook(group_id: str, request: Request):
                                             "text": "✅ Верификация пройдена! Теперь вы можете писать в группу."
                                         }
                                     )
+                                logger.info(f"[verifier-{group_id}] Sent confirmation to user {user_id}")
+                    else:
+                        logger.warning(f"[verifier-{group_id}] Group not found")
         
         return {"ok": True}
     except Exception as e:
-        logger.error(f"Verifier webhook error: {e}")
+        logger.error(f"Verifier webhook error: {e}", exc_info=True)
         return {"ok": False}
 
 
@@ -478,6 +494,7 @@ async def verifier_bot_webhook(group_id: str, request: Request):
 async def bot_webhook(request: Request):
     try:
         data = await request.json()
+        logger.debug(f"[webhook] Received: {json.dumps(data)[:500]}")
         
         # Handle bot added/removed from group
         if "my_chat_member" in data:
@@ -524,11 +541,17 @@ async def bot_webhook(request: Request):
                 
                 # Check if this is a system message (user joined)
                 if message.get("new_chat_members") or message.get("left_chat_member"):
+                    logger.info(f"[{chat_id}] System message detected: new_chat_members={bool(message.get('new_chat_members'))}, left_chat_member={bool(message.get('left_chat_member'))}")
                     groups = load_groups()
                     group = next((g for g in groups if g["id"] == chat_id), None)
-                    if group and group.get("settings", {}).get("deleteSystemMessages"):
-                        if BOT_TOKEN:
+                    if group:
+                        delete_enabled = group.get("settings", {}).get("deleteSystemMessages", False)
+                        logger.info(f"[{chat_id}] deleteSystemMessages={delete_enabled}, BOT_TOKEN={'set' if BOT_TOKEN else 'not set'}")
+                        if delete_enabled and BOT_TOKEN:
+                            logger.info(f"[{chat_id}] Deleting system message {message_id}")
                             await delete_message(BOT_TOKEN, int(chat_id), message_id)
+                    else:
+                        logger.warning(f"[{chat_id}] Group not found in database")
                     return {"ok": True}
                 
                 # Check verification
@@ -537,14 +560,23 @@ async def bot_webhook(request: Request):
                 
                 if group:
                     verifier = group.get("settings", {}).get("verifier", {})
+                    verifier_enabled = verifier.get("enabled", False)
                     
-                    if verifier.get("enabled") and user_id and BOT_TOKEN:
+                    logger.debug(f"[{chat_id}] Message from user {user_id}, verifier_enabled={verifier_enabled}")
+                    
+                    if verifier_enabled and user_id and BOT_TOKEN:
                         # Skip bots
                         if user.get("is_bot"):
+                            logger.debug(f"[{chat_id}] Skipping bot user {user_id}")
                             return {"ok": True}
                         
                         # Check if user is verified
-                        if not is_user_verified(chat_id, user_id):
+                        user_verified = is_user_verified(chat_id, user_id)
+                        logger.info(f"[{chat_id}] User {user_id} verified={user_verified}")
+                        
+                        if not user_verified:
+                            logger.info(f"[{chat_id}] User {user_id} not verified, deleting message and muting")
+                            
                             # Delete their message
                             await delete_message(BOT_TOKEN, int(chat_id), message_id)
                             
@@ -557,16 +589,22 @@ async def bot_webhook(request: Request):
                                 await delete_message(BOT_TOKEN, int(chat_id), prev_msg_id)
                             
                             # Send new verification message
+                            bot_username = verifier.get("botUsername", "")
+                            logger.info(f"[{chat_id}] Sending verify message, botUsername={bot_username}")
+                            
                             new_msg_id = await send_verify_message(
                                 BOT_TOKEN,
                                 int(chat_id),
                                 verifier.get("messageText", "Пройдите верификацию"),
                                 verifier.get("buttonText", "Верификация"),
-                                verifier.get("botUsername", "")
+                                bot_username
                             )
                             
                             if new_msg_id:
                                 last_verify_messages[chat_id] = new_msg_id
+                                logger.info(f"[{chat_id}] Sent verify message {new_msg_id}")
+                            else:
+                                logger.warning(f"[{chat_id}] Failed to send verify message")
         
         return {"ok": True}
     except Exception as e:
@@ -1122,6 +1160,63 @@ async def health():
         "sessions": len(sync_sessions()),
         "groups": len(load_groups()),
         "active_chats": list(active_chats.keys())
+    }
+
+
+@app.get("/debug/{group_id}")
+async def debug_group(group_id: str):
+    """Debug endpoint to check group settings and webhook status"""
+    groups = load_groups()
+    group = next((g for g in groups if g["id"] == group_id), None)
+    
+    if not group:
+        return {"error": "Group not found"}
+    
+    settings = group.get("settings", {})
+    verifier = settings.get("verifier", {})
+    
+    # Check main bot webhook
+    main_webhook_info = None
+    if BOT_TOKEN:
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getWebhookInfo")
+                main_webhook_info = response.json()
+        except Exception as e:
+            main_webhook_info = {"error": str(e)}
+    
+    # Check verifier bot webhook
+    verifier_webhook_info = None
+    verifier_token = verifier.get("botToken", "")
+    if verifier_token:
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.get(f"https://api.telegram.org/bot{verifier_token}/getWebhookInfo")
+                verifier_webhook_info = response.json()
+        except Exception as e:
+            verifier_webhook_info = {"error": str(e)}
+    
+    # Get verified users for this group
+    verified_users = list(load_verified_users(group_id))
+    
+    return {
+        "group_id": group_id,
+        "group_title": group.get("title"),
+        "settings": {
+            "deleteSystemMessages": settings.get("deleteSystemMessages", False),
+            "verifier": {
+                "enabled": verifier.get("enabled", False),
+                "botToken": "***" + verifier_token[-10:] if verifier_token else None,
+                "botUsername": verifier.get("botUsername", ""),
+                "messageText": verifier.get("messageText", ""),
+                "buttonText": verifier.get("buttonText", "")
+            }
+        },
+        "main_bot_token": "***" + BOT_TOKEN[-10:] if BOT_TOKEN else None,
+        "main_webhook": main_webhook_info,
+        "verifier_webhook": verifier_webhook_info,
+        "verified_users": verified_users,
+        "verified_users_count": len(verified_users)
     }
 
 
