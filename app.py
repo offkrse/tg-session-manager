@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 load_dotenv()
 
-VERSION_APP = "2.0"
+VERSION_APP = "2.1"
 
 API_ID = os.getenv("API_ID")
 API_HASH = os.getenv("API_HASH")
@@ -431,45 +431,48 @@ async def send_verify_message(bot_token: str, chat_id: int, text: str, button_te
 # === Verifier Bot Webhook ===
 @app.post("/verifier-webhook/{group_id}")
 async def verifier_bot_webhook(group_id: str, request: Request):
-    """Webhook for the verifier bot (the one user clicks /start on)"""
+    """Webhook for the verifier bot - handles /start in private chat for verification confirmation"""
     try:
         data = await request.json()
         logger.info(f"[verifier-{group_id}] Received webhook: {json.dumps(data)[:500]}")
         
-        # Handle /start command in private chat
         if "message" in data:
             message = data["message"]
             chat = message.get("chat", {})
             user = message.get("from", {})
             text = message.get("text", "")
+            chat_type = chat.get("type", "")
+            user_id = user.get("id")
             
-            logger.info(f"[verifier-{group_id}] Message from user {user.get('id')} in chat type {chat.get('type')}: {text}")
+            logger.info(f"[verifier-{group_id}] Message from user {user_id} in chat type {chat_type}: {text[:50] if text else '<no text>'}")
             
-            # Only handle private messages with /start
-            if chat.get("type") == "private" and text.startswith("/start"):
-                user_id = user.get("id")
-                
+            # Handle /start command ONLY in private chat
+            if chat_type == "private" and text and text.startswith("/start"):
                 if user_id:
-                    logger.info(f"[verifier-{group_id}] Verifying user {user_id}")
+                    logger.info(f"[verifier-{group_id}] Private /start from user {user_id}, verifying...")
                     
                     # Verify the user
                     verify_user(group_id, user_id)
                     
-                    # Get group settings to unmute
+                    # Get group settings
                     groups = load_groups()
                     group = next((g for g in groups if g["id"] == group_id), None)
                     
                     if group:
                         verifier = group.get("settings", {}).get("verifier", {})
+                        verifier_token = verifier.get("botToken", "")
+                        
                         logger.info(f"[verifier-{group_id}] verifier.enabled={verifier.get('enabled')}, BOT_TOKEN={'set' if BOT_TOKEN else 'not set'}")
                         
-                        if verifier.get("enabled") and BOT_TOKEN:
-                            # Unmute using main bot
-                            logger.info(f"[verifier-{group_id}] Unmuting user {user_id}")
-                            await unmute_user(BOT_TOKEN, int(group_id), user_id)
+                        if verifier.get("enabled"):
+                            # Unmute using main bot (BOT_TOKEN) - the one that sits in the group
+                            if BOT_TOKEN:
+                                logger.info(f"[verifier-{group_id}] Unmuting user {user_id} using main bot")
+                                await unmute_user(BOT_TOKEN, int(group_id), user_id)
+                            else:
+                                logger.warning(f"[verifier-{group_id}] BOT_TOKEN not set, cannot unmute")
                             
-                            # Send confirmation
-                            verifier_token = verifier.get("botToken", "")
+                            # Send confirmation using verifier bot token
                             if verifier_token:
                                 async with httpx.AsyncClient() as client:
                                     await client.post(
@@ -482,6 +485,8 @@ async def verifier_bot_webhook(group_id: str, request: Request):
                                 logger.info(f"[verifier-{group_id}] Sent confirmation to user {user_id}")
                     else:
                         logger.warning(f"[verifier-{group_id}] Group not found")
+            
+            # Ignore group messages on this webhook - they go to main /webhook
         
         return {"ok": True}
     except Exception as e:
