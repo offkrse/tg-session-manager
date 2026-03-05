@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 load_dotenv()
 
-VERSION_APP = "1.7"
+VERSION_APP = "1.8"
 
 API_ID = os.getenv("API_ID")
 API_HASH = os.getenv("API_HASH")
