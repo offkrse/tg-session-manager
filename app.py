@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 load_dotenv()
 
-VERSION_APP = "1.4"
+VERSION_APP = "1.5"
 
 API_ID = os.getenv("API_ID")
 API_HASH = os.getenv("API_HASH")
@@ -88,7 +88,19 @@ class GroupSettings(BaseModel):
     nightStartHour: int = 23
     nightEndHour: int = 7
     inviteLink: str = ""
-    botAssignments: Dict[str, str] = {}  # botName -> userId
+    botAssignments: Dict[str, str] = {}
+    deleteSystemMessages: bool = False
+    verifier: dict = {
+        "enabled": False,
+        "botToken": "",
+        "botLink": "",
+        "messageText": "Для отправки сообщений пройдите верификацию",
+        "buttonText": "Верификация"
+    }
+
+
+# Track completed groups
+completed_groups: set = set()
 
 
 # === Data helpers ===
@@ -552,6 +564,7 @@ async def get_groups():
     groups = load_groups()
     for g in groups:
         g["isRunning"] = g["id"] in active_chats
+        g["isCompleted"] = g["id"] in completed_groups
         g["status"] = chat_status.get(g["id"])
         g["bots"] = get_group_bots(g["id"])
     return {"success": True, "data": groups}
@@ -565,6 +578,7 @@ async def get_group(group_id: str):
         raise HTTPException(status_code=404, detail="Group not found")
     
     group["isRunning"] = group_id in active_chats
+    group["isCompleted"] = group_id in completed_groups
     group["status"] = chat_status.get(group_id)
     group["bots"] = get_group_bots(group_id)
     
@@ -580,6 +594,7 @@ async def refresh_group(group_id: str):
         raise HTTPException(status_code=404, detail="Group not found")
     
     group["isRunning"] = group_id in active_chats
+    group["isCompleted"] = group_id in completed_groups
     group["status"] = chat_status.get(group_id)
     group["bots"] = get_group_bots(group_id)
     
@@ -763,7 +778,15 @@ async def start_chat(group_id: str):
     if not group:
         raise HTTPException(status_code=404, detail="Group not found")
     
+    # Remove from completed when starting
+    completed_groups.discard(group_id)
+    
     settings = GroupSettings(**group.get("settings", {}))
+    
+    # Auto-verify all sessions for verifier bot
+    if settings.verifier.get("enabled") and settings.verifier.get("botToken"):
+        await verify_sessions_for_group(group_id, settings)
+    
     task = asyncio.create_task(run_chat_imitation(group_id, settings))
     active_chats[group_id] = task
     
@@ -776,6 +799,10 @@ async def stop_chat(group_id: str):
         return {"success": False, "error": "Not running"}
     
     active_chats.pop(group_id).cancel()
+    
+    # Also stop deletion task if running
+    if group_id in deletion_tasks:
+        deletion_tasks.pop(group_id).cancel()
     
     if group_id in chat_status:
         del chat_status[group_id]
@@ -880,9 +907,224 @@ async def debug_text_file():
     return result
 
 
+# === Verifier Functions ===
+VERIFIER_DATA_DIR = CACHE_DIR / "verifier"
+VERIFIER_DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def get_verified_users_file(group_id: str) -> Path:
+    return VERIFIER_DATA_DIR / f"{group_id}_verified.json"
+
+
+def load_verified_users(group_id: str) -> set:
+    filepath = get_verified_users_file(group_id)
+    if filepath.exists():
+        try:
+            with open(filepath, "r") as f:
+                data = json.load(f)
+                return set(data.get("users", []))
+        except:
+            pass
+    return set()
+
+
+def save_verified_users(group_id: str, users: set):
+    filepath = get_verified_users_file(group_id)
+    with open(filepath, "w") as f:
+        json.dump({"users": list(users)}, f)
+
+
+def add_verified_user(group_id: str, user_id: int):
+    users = load_verified_users(group_id)
+    users.add(user_id)
+    save_verified_users(group_id, users)
+
+
+async def verify_sessions_for_group(group_id: str, settings: GroupSettings):
+    """Auto-verify all telethon sessions for the verifier bot"""
+    logger.info(f"[{group_id}] Auto-verifying sessions for verifier...")
+    
+    sessions = load_sessions_meta()
+    bot_assignments = settings.botAssignments or {}
+    
+    # Get all user IDs that have sessions assigned
+    user_ids_with_sessions = set()
+    for s in sessions:
+        if s.get("userId"):
+            user_ids_with_sessions.add(s["userId"])
+    
+    # Get all assigned users from bot assignments
+    assigned_user_ids = set(bot_assignments.values())
+    
+    # For each session, get the Telegram user ID and verify it
+    verified_count = 0
+    
+    for session in sessions:
+        if not session.get("userId"):
+            continue
+        if session["userId"] not in assigned_user_ids:
+            continue
+            
+        session_id = session["id"]
+        session_path = SESSIONS_DIR / f"{session_id}.session"
+        
+        if not session_path.exists():
+            continue
+        
+        try:
+            from telethon import TelegramClient
+            
+            client = TelegramClient(str(session_path.with_suffix('')), int(API_ID), API_HASH)
+            await client.connect()
+            
+            if await client.is_user_authorized():
+                me = await client.get_me()
+                if me:
+                    add_verified_user(group_id, me.id)
+                    verified_count += 1
+                    logger.info(f"[{group_id}] Verified session {session_id} (user {me.id})")
+            
+            await client.disconnect()
+        except Exception as e:
+            logger.error(f"[{group_id}] Error verifying session {session_id}: {e}")
+    
+    logger.info(f"[{group_id}] Auto-verified {verified_count} sessions")
+
+
+async def handle_verifier_webhook(group_id: str, user_id: int, settings: GroupSettings):
+    """Handle verification from external bot webhook"""
+    add_verified_user(group_id, user_id)
+    logger.info(f"[{group_id}] User {user_id} verified via webhook")
+
+
+@app.post("/verifier/{group_id}/verify")
+async def verify_user_endpoint(group_id: str, request: Request):
+    """Endpoint for external verifier bot to call when user is verified"""
+    try:
+        data = await request.json()
+        user_id = data.get("user_id")
+        
+        if not user_id:
+            return {"success": False, "error": "user_id required"}
+        
+        add_verified_user(group_id, int(user_id))
+        
+        # Unmute user in the group if possible
+        groups = load_groups()
+        group = next((g for g in groups if g["id"] == group_id), None)
+        
+        if group:
+            verifier = group.get("settings", {}).get("verifier", {})
+            if verifier.get("enabled") and verifier.get("botToken"):
+                # Use the verifier bot to unmute
+                try:
+                    async with httpx.AsyncClient() as client:
+                        await client.post(
+                            f"https://api.telegram.org/bot{verifier['botToken']}/restrictChatMember",
+                            json={
+                                "chat_id": int(group_id),
+                                "user_id": user_id,
+                                "permissions": {
+                                    "can_send_messages": True,
+                                    "can_send_audios": True,
+                                    "can_send_documents": True,
+                                    "can_send_photos": True,
+                                    "can_send_videos": True,
+                                    "can_send_video_notes": True,
+                                    "can_send_voice_notes": True,
+                                    "can_send_polls": True,
+                                    "can_send_other_messages": True,
+                                    "can_add_web_page_previews": True
+                                }
+                            }
+                        )
+                        logger.info(f"[{group_id}] Unmuted user {user_id}")
+                except Exception as e:
+                    logger.error(f"[{group_id}] Failed to unmute user {user_id}: {e}")
+        
+        return {"success": True}
+    except Exception as e:
+        logger.error(f"Verify endpoint error: {e}")
+        return {"success": False, "error": str(e)}
+
+
 # === Chat Imitation ===
+async def delete_system_messages_task(group_id: str, settings: GroupSettings):
+    """Background task to delete system messages using a session"""
+    if not settings.deleteSystemMessages:
+        return
+    
+    logger.info(f"[{group_id}] Starting system message deletion task")
+    
+    sessions = load_sessions_meta()
+    bot_assignments = settings.botAssignments or {}
+    
+    # Find a session to use for deletion
+    admin_session = None
+    for s in sessions:
+        if s.get("userId") and s["userId"] in bot_assignments.values():
+            session_path = SESSIONS_DIR / f"{s['id']}.session"
+            if session_path.exists():
+                admin_session = s
+                break
+    
+    if not admin_session:
+        logger.warning(f"[{group_id}] No session available for system message deletion")
+        return
+    
+    try:
+        from telethon import TelegramClient, events
+        
+        session_path = SESSIONS_DIR / f"{admin_session['id']}.session"
+        client = TelegramClient(str(session_path.with_suffix('')), int(API_ID), API_HASH)
+        await client.connect()
+        
+        if not await client.is_user_authorized():
+            logger.warning(f"[{group_id}] Session not authorized for deletion task")
+            await client.disconnect()
+            return
+        
+        chat_id = int(group_id)
+        
+        @client.on(events.ChatAction(chats=chat_id))
+        async def handler(event):
+            # Delete join/leave messages
+            if event.user_joined or event.user_added or event.user_left or event.user_kicked:
+                try:
+                    await event.delete()
+                    logger.info(f"[{group_id}] Deleted system message")
+                except Exception as e:
+                    logger.debug(f"[{group_id}] Could not delete system message: {e}")
+        
+        logger.info(f"[{group_id}] System message deletion handler registered")
+        
+        # Keep running until cancelled
+        while True:
+            await asyncio.sleep(60)
+            
+    except asyncio.CancelledError:
+        logger.info(f"[{group_id}] System message deletion task stopped")
+        try:
+            await client.disconnect()
+        except:
+            pass
+    except Exception as e:
+        logger.error(f"[{group_id}] System message deletion error: {e}")
+
+
+# Track system message deletion tasks
+deletion_tasks: Dict[str, asyncio.Task] = {}
+
+
 async def run_chat_imitation(group_id: str, settings: GroupSettings):
     logger.info(f"[{group_id}] Starting chat imitation")
+    
+    # Start system message deletion task if enabled
+    if settings.deleteSystemMessages and group_id not in deletion_tasks:
+        deletion_tasks[group_id] = asyncio.create_task(delete_system_messages_task(group_id, settings))
+    
+    # Remove from completed if restarting
+    completed_groups.discard(group_id)
     
     text_file = TEXTS_DIR / "text_bad_1.txt"
     messages = parse_text_file(text_file)
@@ -918,6 +1160,15 @@ async def run_chat_imitation(group_id: str, settings: GroupSettings):
         logger.error(f"[{group_id}] No valid bot assignments with sessions")
         return
     
+    # Filter messages to only include those with assigned bots
+    valid_messages = [m for m in filtered if m["name"] in valid_bots]
+    if not valid_messages:
+        logger.error(f"[{group_id}] No messages with valid bot assignments")
+        return
+    
+    total_messages = len(valid_messages)
+    logger.info(f"[{group_id}] Total valid messages: {total_messages}")
+    
     joined_sessions: set = set()
     
     try:
@@ -936,6 +1187,14 @@ async def run_chat_imitation(group_id: str, settings: GroupSettings):
     if not invite_hash:
         logger.warning(f"[{group_id}] No invite link set")
     
+    # Calculate average pause for time estimation
+    hour = datetime.now().hour
+    is_night = hour >= settings.nightStartHour or hour < settings.nightEndHour
+    avg_pause = (
+        (settings.nightPauseMin + settings.nightPauseMax) / 2 if is_night 
+        else (settings.dayPauseMin + settings.dayPauseMax) / 2
+    )
+    
     try:
         from telethon import TelegramClient
         from telethon.tl.functions.messages import ImportChatInviteRequest, CheckChatInviteRequest
@@ -943,25 +1202,24 @@ async def run_chat_imitation(group_id: str, settings: GroupSettings):
         from telethon.errors import UserAlreadyParticipantError, ChatWriteForbiddenError, ChannelPrivateError
         
         msg_idx = 0
-        while True:
-            if msg_idx >= len(filtered):
-                msg_idx = 0
-            
-            msg = filtered[msg_idx]
+        while msg_idx < len(valid_messages):
+            msg = valid_messages[msg_idx]
             bot_name, text = msg["name"], msg["text"]
             line_num = msg["line"]
             
+            remaining = len(valid_messages) - msg_idx
+            estimated_minutes = int(remaining * avg_pause)
+            
+            # Update status with progress info
             chat_status[group_id] = {
                 "isRunning": True,
                 "currentLine": line_num,
                 "currentMessage": text[:100],
-                "currentBotName": bot_name
+                "currentBotName": bot_name,
+                "totalMessages": total_messages,
+                "remainingMessages": remaining,
+                "estimatedMinutes": estimated_minutes
             }
-            
-            if bot_name not in valid_bots:
-                logger.warning(f"[{group_id}] Bot '{bot_name}' not assigned, skipping")
-                msg_idx += 1
-                continue
             
             bot_info = valid_bots[bot_name]
             bot_sessions = bot_info["sessions"]
@@ -991,16 +1249,11 @@ async def run_chat_imitation(group_id: str, settings: GroupSettings):
                         invite_info = await client(CheckChatInviteRequest(invite_hash))
                         
                         if isinstance(invite_info, ChatInviteAlready):
-                            # ChatInviteAlready means the invite was used before,
-                            # but session might have left the group since then!
-                            # We need to verify actual membership
                             logger.info(f"[{group_id}] Session {session_id} used this invite before, verifying membership...")
                             
                             try:
-                                # Try to get the entity and check if we can actually access it
                                 entity = await client.get_entity(chat_id)
                                 
-                                # Try to get participant info to confirm membership
                                 from telethon.tl.functions.channels import GetParticipantRequest
                                 me = await client.get_me()
                                 try:
@@ -1008,7 +1261,6 @@ async def run_chat_imitation(group_id: str, settings: GroupSettings):
                                     logger.info(f"[{group_id}] Session {session_id} confirmed as member")
                                     joined_sessions.add(session_id)
                                 except Exception as participant_err:
-                                    # Not a participant, need to rejoin
                                     logger.warning(f"[{group_id}] Session {session_id} not a participant: {participant_err}")
                                     logger.info(f"[{group_id}] Session {session_id} rejoining via invite...")
                                     try:
@@ -1018,7 +1270,6 @@ async def run_chat_imitation(group_id: str, settings: GroupSettings):
                                         logger.info(f"[{group_id}] Session {session_id} rejoined! Waiting 30s...")
                                         await asyncio.sleep(30)
                                     except UserAlreadyParticipantError:
-                                        # Strange, but let's try anyway
                                         logger.info(f"[{group_id}] Session {session_id} UserAlreadyParticipant on rejoin")
                                         joined_sessions.add(session_id)
                                     except Exception as rejoin_err:
@@ -1027,7 +1278,6 @@ async def run_chat_imitation(group_id: str, settings: GroupSettings):
                                         
                             except Exception as e:
                                 logger.warning(f"[{group_id}] Session {session_id} cannot access group: {e}")
-                                # Try to rejoin
                                 logger.info(f"[{group_id}] Session {session_id} attempting to rejoin...")
                                 try:
                                     result = await client(ImportChatInviteRequest(invite_hash))
@@ -1072,7 +1322,7 @@ async def run_chat_imitation(group_id: str, settings: GroupSettings):
                 if entity:
                     try:
                         await client.send_message(entity, text)
-                        logger.info(f"[{group_id}] #{line_num} {bot_name} ({session_id}): {text[:40]}...")
+                        logger.info(f"[{group_id}] #{line_num} [{msg_idx+1}/{total_messages}] {bot_name} ({session_id}): {text[:40]}...")
                     except ChatWriteForbiddenError:
                         logger.error(f"[{group_id}] Session {session_id} cannot write")
                         joined_sessions.discard(session_id)
@@ -1091,6 +1341,19 @@ async def run_chat_imitation(group_id: str, settings: GroupSettings):
             
             msg_idx += 1
             
+            # Check if we've sent all messages
+            if msg_idx >= len(valid_messages):
+                logger.info(f"[{group_id}] All {total_messages} messages sent! Completing...")
+                completed_groups.add(group_id)
+                if group_id in chat_status:
+                    del chat_status[group_id]
+                if group_id in active_chats:
+                    del active_chats[group_id]
+                # Stop deletion task
+                if group_id in deletion_tasks:
+                    deletion_tasks.pop(group_id).cancel()
+                return
+            
             hour = datetime.now().hour
             is_night = hour >= settings.nightStartHour or hour < settings.nightEndHour
             pause = random.randint(
@@ -1101,7 +1364,7 @@ async def run_chat_imitation(group_id: str, settings: GroupSettings):
             if random.randint(1, 100) <= settings.randomPauseChance:
                 pause += random.randint(settings.randomPauseMin, settings.randomPauseMax)
             
-            logger.info(f"[{group_id}] Waiting {pause} min")
+            logger.info(f"[{group_id}] Waiting {pause} min ({msg_idx}/{total_messages} done)")
             await asyncio.sleep(pause * 60)
             
     except asyncio.CancelledError:
